@@ -57,6 +57,55 @@ curl -s -X PATCH localhost:8000/leads/<lead_id> \
 
 Interactive API docs: `localhost:8000/docs`.
 
+## Deploy to Railway
+
+The repo is set up for a Docker-based Railway deploy: `Dockerfile` builds a
+minimal production image (no dev/test dependencies), `railway.toml`
+configures the build + health check, and `app/core/db.py` automatically
+rewrites Railway's Postgres `DATABASE_URL` (`postgres://...`, sync-driver
+format) into the async-driver format SQLAlchemy needs — you don't need to
+edit the URL yourself.
+
+1. **Push this repo to GitHub** (already done if you're reading this from the
+   `claude/roofing-ai-sales-inspection-7jro12` branch).
+2. **Create a Railway project** → *Deploy from GitHub repo* → pick this repo.
+3. **Set the service's Root Directory to `backend`** (Settings → Root
+   Directory). This repo is a monorepo with the app in a subfolder, so
+   Railway needs to know where the Dockerfile lives.
+4. **Add a Postgres database**: New → Database → PostgreSQL, in the same
+   project. Railway provisions it and exposes a `DATABASE_URL` variable on
+   the Postgres service.
+5. **Wire the Postgres URL into the web service**: in the web service's
+   Variables tab, add `DATABASE_URL` with the value `${{Postgres.DATABASE_URL}}`
+   (Railway's variable-reference syntax — click "Add Reference" in the
+   Railway UI instead of typing it if you'd rather not type it by hand).
+   Without this the app falls back to an on-container SQLite file, which
+   works but is wiped on every redeploy — fine for a first smoke test, not
+   for anything you want to keep.
+6. **Add your API keys as variables** on the web service. At minimum:
+
+   | Variable | Value |
+   |---|---|
+   | `VISION_PROVIDER` | `stub` to start free, or `claude` once you're ready to spend real API calls |
+   | `ANTHROPIC_API_KEY` | your key (only read when `VISION_PROVIDER=claude`) |
+   | `DEV_SEED_TENANT_KEY` | **set this to your own random secret** — it's the API key the seeded dev tenant uses to call the API; the code default (`dev-local-key`) is fine for local dev, not for a public deployment |
+
+   Leave `STORM_PROVIDER` / `PROPERTY_PROVIDER` / `IMAGERY_PROVIDER` as
+   `mock` until you wire up a real one (see "Swapping in a real provider").
+7. **Deploy.** Railway builds the Dockerfile and starts the container; the
+   `/health` check in `railway.toml` gates traffic until the app (and its
+   retrying DB connection — see `init_db_with_retry` in `app/core/db.py`,
+   which handles the web service and Postgres both booting at once) is ready.
+8. **Verify**: `curl https://<your-service>.up.railway.app/health` should
+   return `{"status":"ok"}`. Then run the same `curl` flow from the
+   Quickstart section against that URL instead of `localhost:8000`.
+
+Optional: the standalone job worker (`python -m app.jobs.worker`) isn't
+required — the ingest route drains the queue synchronously — but if you later
+want ingestion off the request path, add it as a second Railway service
+pointed at the same repo/Dockerfile with `startCommand` overridden to
+`python -m app.jobs.worker`.
+
 ## Tests
 
 ```bash
@@ -131,7 +180,10 @@ docker compose up -d
 DATABASE_URL=postgresql+asyncpg://roofing:roofing@localhost:5432/roofing
 ```
 
-No other changes needed — there's no PostGIS dependency to install.
+No other changes needed — there's no PostGIS dependency to install. Plain
+`postgres://...` or `postgresql://...` URLs (what Railway and most managed
+Postgres providers hand out) work too — `app/core/db.py` rewrites the scheme
+to the async driver automatically, see `normalize_database_url`.
 
 ## What's explicitly out of scope for this pass
 
