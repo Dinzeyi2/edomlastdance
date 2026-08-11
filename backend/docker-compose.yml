@@ -1,0 +1,17 @@
+# Optional: a real Postgres instance for anyone who wants to run against
+# something closer to production instead of the default SQLite file. Not
+# required to run the app or the test suite -- see README.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: roofing
+      POSTGRES_PASSWORD: roofing
+      POSTGRES_DB: roofing
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
