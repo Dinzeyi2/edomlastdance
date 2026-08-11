@@ -1,15 +1,20 @@
 # Runtime image for Railway (or any container host). Deliberately minimal --
 # every runtime dependency (fastapi, sqlalchemy, asyncpg, shapely, anthropic,
 # httpx) ships a prebuilt Linux wheel, so no compiler toolchain is needed.
+#
+# NOTE: this Dockerfile is built with the REPO ROOT as the build context (see
+# /railway.json's dockerfilePath), not the backend/ folder -- that's what
+# lets Railway auto-detect this config without any manual "Root Directory"
+# setting. That's why every COPY below is prefixed with backend/.
 FROM python:3.11-slim
 
 WORKDIR /app
 
 # Copy only what's needed to install dependencies first, so dependency layers
 # cache across rebuilds that only touch application code.
-COPY pyproject.toml ./
-COPY app ./app
-COPY fixtures ./fixtures
+COPY backend/pyproject.toml ./
+COPY backend/app ./app
+COPY backend/fixtures ./fixtures
 
 RUN pip install --no-cache-dir .
 

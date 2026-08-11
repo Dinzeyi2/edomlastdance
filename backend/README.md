@@ -59,30 +59,37 @@ Interactive API docs: `localhost:8000/docs`.
 
 ## Deploy to Railway
 
-The repo is set up for a Docker-based Railway deploy: `Dockerfile` builds a
-minimal production image (no dev/test dependencies), `railway.toml`
-configures the build + health check, and `app/core/db.py` automatically
-rewrites Railway's Postgres `DATABASE_URL` (`postgres://...`, sync-driver
-format) into the async-driver format SQLAlchemy needs — you don't need to
-edit the URL yourself.
+The repo ships a **repo-root `railway.json`** that points at
+`backend/Dockerfile`. Railway auto-detects config-as-code at the repo root,
+so this works with zero manual build settings — you do **not** need to find
+or set a "Root Directory" option anywhere in the Railway UI. If Railway ever
+reports it can't determine how to build the app, it means it isn't reading
+`railway.json` (e.g. deploying from a fork/branch that doesn't have it, or a
+"Root Directory" was set on the service from an earlier attempt and needs to
+be cleared back to blank/repo-root) — check that first.
+
+`app/core/db.py` also automatically rewrites Railway's Postgres
+`DATABASE_URL` (`postgres://...`, sync-driver format, sometimes with
+`?sslmode=`) into the async-driver format SQLAlchemy needs — you don't need
+to edit the URL yourself, just paste in whatever Railway gives you.
 
 1. **Push this repo to GitHub** (already done if you're reading this from the
    `claude/roofing-ai-sales-inspection-7jro12` branch).
-2. **Create a Railway project** → *Deploy from GitHub repo* → pick this repo.
-3. **Set the service's Root Directory to `backend`** (Settings → Root
-   Directory). This repo is a monorepo with the app in a subfolder, so
-   Railway needs to know where the Dockerfile lives.
-4. **Add a Postgres database**: New → Database → PostgreSQL, in the same
+2. **Create a Railway project** → *Deploy from GitHub repo* → pick this repo
+   and branch. Leave build settings on their defaults — don't set a Root
+   Directory. Railway should pick up `railway.json` and build via Docker
+   automatically.
+3. **Add a Postgres database**: New → Database → PostgreSQL, in the same
    project. Railway provisions it and exposes a `DATABASE_URL` variable on
    the Postgres service.
-5. **Wire the Postgres URL into the web service**: in the web service's
+4. **Wire the Postgres URL into the web service**: in the web service's
    Variables tab, add `DATABASE_URL` with the value `${{Postgres.DATABASE_URL}}`
    (Railway's variable-reference syntax — click "Add Reference" in the
    Railway UI instead of typing it if you'd rather not type it by hand).
    Without this the app falls back to an on-container SQLite file, which
    works but is wiped on every redeploy — fine for a first smoke test, not
    for anything you want to keep.
-6. **Add your API keys as variables** on the web service. At minimum:
+5. **Add your API keys as variables** on the web service. At minimum:
 
    | Variable | Value |
    |---|---|
@@ -92,11 +99,11 @@ edit the URL yourself.
 
    Leave `STORM_PROVIDER` / `PROPERTY_PROVIDER` / `IMAGERY_PROVIDER` as
    `mock` until you wire up a real one (see "Swapping in a real provider").
-7. **Deploy.** Railway builds the Dockerfile and starts the container; the
-   `/health` check in `railway.toml` gates traffic until the app (and its
+6. **Deploy.** Railway builds `backend/Dockerfile` and starts the container;
+   the `/health` check in `railway.json` gates traffic until the app (and its
    retrying DB connection — see `init_db_with_retry` in `app/core/db.py`,
    which handles the web service and Postgres both booting at once) is ready.
-8. **Verify**: `curl https://<your-service>.up.railway.app/health` should
+7. **Verify**: `curl https://<your-service>.up.railway.app/health` should
    return `{"status":"ok"}`. Then run the same `curl` flow from the
    Quickstart section against that URL instead of `localhost:8000`.
 
