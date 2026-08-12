@@ -1,117 +1,104 @@
-# Roofing AI Lead Engine — Backend
+# RoofAI Analysis Backend
 
-Turns storm events into a ranked list of properties likely to have hail/wind
-damage, each with an evidence packet (imagery, storm data, damage confidence,
-estimated job value) a roofing sales rep can use instead of cold-knocking
-doors.
+The ML backend behind a Lovable-built roofing app: Lovable sends a lat/lng,
+this service downloads aerial imagery, isolates the building footprint, runs
+defect detection, compares against prior-year imagery, scores the roof 0-100,
+uploads the evidence, and returns (or polls back) a structured report.
 
 ```
-Storm ingestion  →  Property resolution  →  Imagery fetch  →  Damage inference  →  Scoring
-   (StormEvent)        (Property)          (ImageryAsset)    (DamageAssessment)      (Lead)
+Lovable map click
+    -> POST /api/v1/analyze/async {lat, lng, user_id, compare_year, ...}
+    -> Railway returns {job_id, status: "queued"}
+    -> Celery worker (separate process, via Redis):
+         imagery fetch -> footprint mask -> 3x3 tile split -> defect detection
+         -> (temporal diff, if compare_year given) -> scoring -> S3 upload
+    -> Lovable polls GET /jobs/{id} (or receives a signed webhook)
+    -> job.result matches the AnalysisResult shape below
 ```
 
-Every external dependency (storm data, property records, imagery, vision) sits
-behind an abstract interface (`app/providers/base.py`) with a **mock
-implementation as the default** and a **real implementation stubbed out** for
-later. Nothing in `app/pipeline/*` or `app/api/*` needs to change when a real
-vendor gets wired in — see "Swapping in a real provider" below.
+## What's real vs. what's a stub
 
-## Quickstart (zero external services required)
+Everything is wired end-to-end and testable right now (27 passing tests, no
+network calls, no paid API keys). But three pieces are real vendors this repo
+can't call without your credentials/infrastructure, and two are heavy ML
+models this repo can't run without a trained checkpoint. Being precise about
+which is which:
+
+| Piece | Status | Notes |
+|---|---|---|
+| API gateway, job queue, DB, storage, webhook, scoring, temporal diff | **Real, working** | See "What's genuinely real" below |
+| Rule-based defect detector | **Real, working** | Actual OpenCV contour detection, not a random-number stand-in -- see `app/services/defects.py` |
+| `IMAGERY_PROVIDER=mock` | **Real, working** | Deterministic synthetic "aerial roof" art (`app/services/roof_art.py`), not a real photo |
+| `FOOTPRINT_PROVIDER=center_crop` | **Real, working** | The simple baseline your spec described as the interim step before SAM-2 |
+| `FOOTPRINT_PROVIDER=osm` | **Real code, not live-verified** | Real Overpass API client (free, no key) -- this sandbox's network egress policy blocks `overpass-api.de`, so I could not execute a live call. Should work once deployed; smoke-test it |
+| `STORAGE_PROVIDER=s3` | **Real code, not live-verified** | Real boto3 client (AWS S3 or R2 via `S3_ENDPOINT`) -- same egress restriction, not live-tested from this sandbox |
+| `LLM_PROVIDER=openai` | **Real code, not live-verified** | Real OpenAI call -- same restriction, needs your `OPENAI_API_KEY` |
+| Webhook to Lovable | **Real code, not live-verified** | Real signed HTTP POST -- same restriction |
+| `IMAGERY_PROVIDER=google_solar` / `nearmap` | **Stub** | Real vendor, real request/response shapes not implemented yet -- needs your API key and, for Google Solar, GeoTIFF handling not in `requirements.txt` |
+| `FOOTPRINT_PROVIDER=sam2` | **Stub** | Needs the `sam2` package, a multi-GB checkpoint, and GPU-class compute -- none of which this environment has |
+| `DEFECT_PROVIDER=yolo` | **Stub until you provide `YOLO_MODEL_PATH`** | No trained roof-defect model or labeled dataset exists yet -- this is step 9 in the build order, deliberately last |
+
+"Not live-verified" means: implemented against the library/API's documented
+behavior, unit-testable logic all passes, but I could not execute the actual
+network call from this sandbox (its egress policy allowlists specific hosts
+and blocks arbitrary third-party APIs). Worth a smoke test right after your
+first deploy, before trusting it in production.
+
+### What's genuinely real (no caveats)
+
+FastAPI gateway with your exact endpoints and auth, the Job/Feedback/
+BuildingFootprintCache Postgres (or SQLite) models, the Celery+Redis async
+pipeline (verified against a **real Redis broker and a separate worker
+process**, not just Celery's inline eager mode), the 3x3 tile splitter, the
+deterministic scoring formula, the temporal diff logic, and local-disk
+storage.
+
+## Local development (zero infra)
 
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
+pip install -r requirements.txt
+cp .env.example .env    # CELERY_TASK_ALWAYS_EAGER=true by default -- no Redis needed
 
 uvicorn app.main:app --reload
 ```
 
-On startup the app creates its SQLite schema and seeds one dev tenant, keyed
-by `DEV_SEED_TENANT_KEY` in `.env` (defaults to `dev-local-key`). Then, in
-another terminal:
-
 ```bash
-KEY=dev-local-key
+KEY=dev-local-key   # matches RAILWAY_API_KEY in .env.example
 
-# 1. Register a coverage area (a GeoJSON Polygon) for the dev tenant.
-curl -s -X POST localhost:8000/territories \
-  -H "Content-Type: application/json" -H "X-Tenant-Key: $KEY" \
-  -d '{"name":"DFW metro","polygon_geojson":"{\"type\":\"Polygon\",\"coordinates\":[[[-97.3,32.3],[-96.3,32.3],[-96.3,33.3],[-97.3,33.3],[-97.3,32.3]]]}"}'
+curl -s -X POST localhost:8000/api/v1/analyze \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" \
+  -d '{"lat":40.7128,"lng":-74.0060,"compare_year":2023}' | python3 -m json.tool
 
-# 2. Trigger ingestion. This runs the ENTIRE pipeline synchronously (mock
-#    providers are instant) and returns once every stage has finished.
-curl -s -X POST localhost:8000/storm-events/ingest -H "Content-Type: application/json" -d '{}'
-
-# 3. See the ranked leads.
-curl -s localhost:8000/leads -H "X-Tenant-Key: $KEY" | python3 -m json.tool
-
-# 4. Pull the full evidence packet for one lead.
-curl -s localhost:8000/leads/<lead_id> -H "X-Tenant-Key: $KEY" | python3 -m json.tool
-
-# 5. Record an outcome (the feedback loop for future scoring tuning).
-curl -s -X PATCH localhost:8000/leads/<lead_id> \
-  -H "Content-Type: application/json" -H "X-Tenant-Key: $KEY" \
-  -d '{"status":"contacted"}'
+# or the async path:
+JOB=$(curl -s -X POST localhost:8000/api/v1/analyze/async \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" \
+  -d '{"lat":40.7128,"lng":-74.0060}')
+echo "$JOB"
+curl -s localhost:8000/api/v1/jobs/<job_id> -H "Authorization: Bearer $KEY" | python3 -m json.tool
 ```
 
-Interactive API docs: `localhost:8000/docs`.
+Interactive docs: `localhost:8000/docs`.
 
-## Deploy to Railway
+### With a real Postgres + Redis + separate worker process
 
-The repo ships a **repo-root `railway.json`** that points at
-`backend/Dockerfile`. Railway auto-detects config-as-code at the repo root,
-so this works with zero manual build settings — you do **not** need to find
-or set a "Root Directory" option anywhere in the Railway UI. If Railway ever
-reports it can't determine how to build the app, it means it isn't reading
-`railway.json` (e.g. deploying from a fork/branch that doesn't have it, or a
-"Root Directory" was set on the service from an earlier attempt and needs to
-be cleared back to blank/repo-root) — check that first.
+```bash
+docker compose up -d   # postgres + redis
+# .env
+DATABASE_URL=postgresql://roofai:roofai@localhost:5432/roofai
+CELERY_TASK_ALWAYS_EAGER=false
 
-`app/core/db.py` also automatically rewrites Railway's Postgres
-`DATABASE_URL` (`postgres://...`, sync-driver format, sometimes with
-`?sslmode=`) into the async-driver format SQLAlchemy needs — you don't need
-to edit the URL yourself, just paste in whatever Railway gives you.
+# terminal 1
+uvicorn app.main:app --reload
+# terminal 2
+celery -A app.workers.celery_app worker --loglevel=info
+```
 
-1. **Push this repo to GitHub** (already done if you're reading this from the
-   `claude/roofing-ai-sales-inspection-7jro12` branch).
-2. **Create a Railway project** → *Deploy from GitHub repo* → pick this repo
-   and branch. Leave build settings on their defaults — don't set a Root
-   Directory. Railway should pick up `railway.json` and build via Docker
-   automatically.
-3. **Add a Postgres database**: New → Database → PostgreSQL, in the same
-   project. Railway provisions it and exposes a `DATABASE_URL` variable on
-   the Postgres service.
-4. **Wire the Postgres URL into the web service**: in the web service's
-   Variables tab, add `DATABASE_URL` with the value `${{Postgres.DATABASE_URL}}`
-   (Railway's variable-reference syntax — click "Add Reference" in the
-   Railway UI instead of typing it if you'd rather not type it by hand).
-   Without this the app falls back to an on-container SQLite file, which
-   works but is wiped on every redeploy — fine for a first smoke test, not
-   for anything you want to keep.
-5. **Add your API keys as variables** on the web service. At minimum:
-
-   | Variable | Value |
-   |---|---|
-   | `VISION_PROVIDER` | `stub` to start free, or `claude` once you're ready to spend real API calls |
-   | `ANTHROPIC_API_KEY` | your key (only read when `VISION_PROVIDER=claude`) |
-   | `DEV_SEED_TENANT_KEY` | **set this to your own random secret** — it's the API key the seeded dev tenant uses to call the API; the code default (`dev-local-key`) is fine for local dev, not for a public deployment |
-
-   Leave `STORM_PROVIDER` / `PROPERTY_PROVIDER` / `IMAGERY_PROVIDER` as
-   `mock` until you wire up a real one (see "Swapping in a real provider").
-6. **Deploy.** Railway builds `backend/Dockerfile` and starts the container;
-   the `/health` check in `railway.json` gates traffic until the app (and its
-   retrying DB connection — see `init_db_with_retry` in `app/core/db.py`,
-   which handles the web service and Postgres both booting at once) is ready.
-7. **Verify**: `curl https://<your-service>.up.railway.app/health` should
-   return `{"status":"ok"}`. Then run the same `curl` flow from the
-   Quickstart section against that URL instead of `localhost:8000`.
-
-Optional: the standalone job worker (`python -m app.jobs.worker`) isn't
-required — the ingest route drains the queue synchronously — but if you later
-want ingestion off the request path, add it as a second Railway service
-pointed at the same repo/Dockerfile with `startCommand` overridden to
-`python -m app.jobs.worker`.
+This is what was actually run and verified while building this (real Redis
+broker, a genuinely separate worker process, `POST /analyze/async` returning
+immediately while the worker completes the job in the background) -- not
+just the eager-mode shortcut.
 
 ## Tests
 
@@ -119,100 +106,139 @@ pointed at the same repo/Dockerfile with `startCommand` overridden to
 pytest
 ```
 
-No network calls, no external services — everything runs against mock
-providers and a scratch SQLite file. Covers: scoring math, geo point-in-polygon,
-each mock provider's determinism, a full pipeline drain asserting ranked leads
-come out the other end (and that tenants outside a storm's territory correctly
-see nothing), and the HTTP API end to end (auth, ingest, list/detail/patch).
+27 tests, no network calls: scoring math, temporal diff logic, deterministic
+mock imagery, the rule-based detector's actual contour detection (including a
+regression test for an edge-artifact bug the detector caught during
+development -- see `app/services/roof_art.py`'s comments), and the full HTTP
+API (auth, sync analyze, async analyze + poll, feedback, unknown-job 404).
+Async tests run via `CELERY_TASK_ALWAYS_EAGER=true` so they're deterministic
+and don't need Redis.
 
-## Architecture notes / deviations from a "textbook" version
+## API reference
 
-- **No PostGIS.** Storm/territory polygons are stored as GeoJSON text;
-  point-in-polygon filtering happens in application code via Shapely
-  (`app/pipeline/geo.py`), not a DB-side `ST_Within`. This keeps the app
-  running against plain SQLite *or* Postgres with zero GIS extension setup.
-  It scales less gracefully than an indexed spatial query — fine at the lead
-  volumes this product deals in (thousands of properties per territory, not
-  millions); revisit if that changes.
-- **No Redis/Celery.** Jobs live in a plain DB table (`app/models/job.py`)
-  with a claim-one-pending helper (`SELECT ... FOR UPDATE SKIP LOCKED` on
-  Postgres) in `app/jobs/queue.py`. The ingest API route drains the queue
-  synchronously in-request (`app/jobs/runner.py`) so a single `POST
-  /storm-events/ingest` call demonstrates the whole pipeline without a
-  second process running. `python -m app.jobs.worker` is also provided as a
-  standalone poller for a more production-shaped deployment (real vendor
-  APIs are not instant, and you won't want ingestion blocking the request).
-- **`Base.metadata.create_all` instead of Alembic migrations.** Fine for a v1
-  scaffold with no production data yet; promote to real Alembic migrations
-  before this touches a persistent database with data worth preserving.
-- **Vision defaults to a free, deterministic stub** (`VISION_PROVIDER=stub`)
-  that doesn't look at the image at all — it derives a plausible confidence
-  from storm severity + roof attributes, so the whole pipeline runs at zero
-  API cost. `VISION_PROVIDER=claude` is fully implemented
-  (`app/providers/vision/claude.py`) and sends the image to a Claude vision
-  model with a structured prompt; it's not the default because it costs real
-  API calls per image and mock imagery is schematic placeholder art, not a
-  real roof.
+All `/api/v1/*` routes require `Authorization: Bearer <RAILWAY_API_KEY>`.
+
+**`POST /api/v1/analyze`** -- runs the full pipeline inline, returns the
+result directly. Fine for testing; for real traffic prefer the async path so
+the caller isn't holding a request open for 30-120s.
+
+**`POST /api/v1/analyze/async`**
+```json
+{"lat": 40.7128, "lng": -74.0060, "address": "123 Main St", "user_id": "uuid", "compare_year": 2023, "resolution_cm": 10, "include_raw_tiles": true}
+```
+->
+```json
+{"job_id": "job_abc123", "status": "queued", "estimated_seconds": 60}
+```
+
+**`GET /api/v1/jobs/{job_id}`**
+```json
+{"job_id": "job_abc123", "status": "processing", "progress": 0.45, "stage": "defect_detection", "result": null, "error": null}
+```
+When `status: "completed"`, `result` matches:
+```json
+{
+  "building_id": "bld_...", "score": 67, "condition": "aging", "confidence": 0.82,
+  "resolution_cm": 10, "footprint_masked": true, "imagery_date": "2026-06-15",
+  "findings": [{"type": "staining", "severity": "moderate", "bbox": [0.34,0.21,0.52,0.38], "tile_index": [1,2], "confidence": 0.91}],
+  "temporal": {"previous_score": 43, "score_delta": 24, "change_summary": "New staining visible since prior imagery."},
+  "image_urls": {"full": "...", "masked": "...", "tiles": ["...", "..."]}
+}
+```
+
+**`POST /api/v1/feedback`** -- roofer corrections, saved to Postgres as
+future training data for a real defect model.
+
+**`GET /health`** -- no auth, used by Railway's health check.
+
+## Deploy to Railway
+
+Two services in one Railway project, from this same repo:
+
+1. **Web service.** Deploy from GitHub as usual -- the repo-root
+   `railway.json` auto-configures the Docker build (`backend/Dockerfile`) and
+   health check with zero manual "Root Directory" setting.
+2. **Worker service.** Add a second service from the *same* repo/branch. In
+   its Settings, override **Start Command** to:
+   ```
+   celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+   ```
+   Same image, different process -- this is the background worker that
+   actually runs the pipeline.
+3. **Add Postgres and Redis** (New -> Database, twice) to the project.
+4. **On both services**, add `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
+   and `REDIS_URL` = `${{Redis.REDIS_URL}}` (Railway variable references --
+   use "Add Reference" in the UI). Both services must share the same
+   database and broker.
+5. **On both services**, set:
+
+   | Variable | Value |
+   |---|---|
+   | `RAILWAY_API_KEY` | your own random secret -- this is what Lovable's server function sends as the bearer token |
+   | `CELERY_TASK_ALWAYS_EAGER` | `false` (or just omit it -- default is already false) |
+   | `STORAGE_PROVIDER` | `s3` once you have a bucket, otherwise leave `local` (ephemeral, fine for a first smoke test only) |
+   | `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | your R2/S3 credentials, if `STORAGE_PROVIDER=s3` |
+   | `IMAGERY_PROVIDER`, `FOOTPRINT_PROVIDER`, `DEFECT_PROVIDER`, `LLM_PROVIDER` | leave at their real-and-free defaults (`mock`, `center_crop`, `rule_based`, `none`) until you wire up a real vendor -- see the table above |
+   | `LOVABLE_WEBHOOK_URL` / `WEBHOOK_SECRET` | if you want the push-on-completion path in addition to polling |
+
+6. **Verify**: `curl https://<web-service>.up.railway.app/health` ->
+   `{"status":"ok"}`. Then run the same `curl` flow from "Local development"
+   against that URL. Watch the worker service's logs for `Task
+   run_analysis_task[...] received` / `succeeded` to confirm it's actually
+   processing jobs.
+
+## Lovable integration
+
+Your `analyzeRoofWithRailway` server function is correct as sketched -- point
+`RAILWAY_API_URL` at the web service's Railway URL and `RAILWAY_API_KEY` at
+the same secret set in step 5 above. Have `TeslaMap.tsx` call `POST
+/api/v1/analyze/async`, then poll `GET /api/v1/jobs/{job_id}` (or receive the
+webhook at whatever route you wire up to accept `LOVABLE_WEBHOOK_URL`'s
+signed POST -- verify the `X-Webhook-Signature` header as an HMAC-SHA256 of
+the raw body using `WEBHOOK_SECRET` before trusting it).
 
 ## Swapping in a real provider
 
-1. Implement the interface in `app/providers/base.py` (e.g. fill in
-   `app/providers/storm/noaa.py` against the NOAA NCEI Storm Events API).
-2. Add it to the lookup dict in `app/providers/__init__.py`.
-3. Set the matching env var (e.g. `STORM_PROVIDER=noaa`).
-
-Nothing in `app/pipeline/*` or `app/api/*` changes.
-
-## Try the real vision path without a real imagery vendor
-
-```bash
-# .env
-VISION_PROVIDER=claude
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Re-run the ingest flow above — inference now sends the bundled schematic
-fixture images (`fixtures/sample_roofs/`, see `scripts/generate_fixtures.py`)
-to Claude and stores its structured damage assessment. This proves the
-integration path even before a real imagery vendor is wired up. Since the
-fixtures are schematic placeholders (not real aerial photos), don't read
-much into the actual damage_confidence values it returns — the point is that
-the call, parsing, and storage all work.
-
-## Using Postgres instead of SQLite
-
-```bash
-docker compose up -d
-# .env
-DATABASE_URL=postgresql+asyncpg://roofing:roofing@localhost:5432/roofing
-```
-
-No other changes needed — there's no PostGIS dependency to install. Plain
-`postgres://...` or `postgresql://...` URLs (what Railway and most managed
-Postgres providers hand out) work too — `app/core/db.py` rewrites the scheme
-to the async driver automatically, see `normalize_database_url`.
+Same pattern throughout: implement the interface in the matching
+`app/services/*.py` (each stub has a docstring saying exactly what's needed),
+add it to that file's `_PROVIDERS` dict, set the matching env var. Nothing in
+`app/routes/*` or `app/services/pipeline.py` needs to change.
 
 ## What's explicitly out of scope for this pass
 
-- Frontend/dashboard UI
-- Real NOAA/Regrid/Nearmap integrations (interfaces + stubs only, see
-  `app/providers/*/noaa.py`, `regrid.py`, `nearmap.py`)
-- Billing/usage metering
-- Full auth (OAuth/JWT, roles) — a single hashed API key per tenant only
-- A trained custom roof-damage CV model — vision is an LLM call or a stub
+- Frontend/dashboard (that's Lovable)
+- Real Google Solar / Nearmap imagery integration (stubbed, needs your API key + GeoTIFF handling for Solar API)
+- SAM-2 segmentation (stubbed, needs GPU-class compute + a multi-GB checkpoint)
+- A trained YOLO defect model (needs a labeled dataset that doesn't exist yet -- `POST /feedback` is the mechanism to start collecting one)
+- Rate limiting, request-level caching in Redis beyond the job queue itself
+- Alembic migrations (uses `Base.metadata.create_all` -- fine pre-production, promote before this holds data worth preserving)
 
 ## Repo layout
 
 ```
 app/
-  core/       config, DB engine/session, dev tenant seeding
-  models/     SQLAlchemy tables
-  schemas/    Pydantic request/response models
-  providers/  base interfaces + mock/real implementations per data source
-  pipeline/   one function per pipeline stage, plus scoring + geo helpers
-  jobs/       DB-backed job queue, drain loop, standalone worker
-  api/routes/ FastAPI routers
-tests/        pytest, all against mock providers, no network calls
-fixtures/     schematic placeholder "aerial roof" images for mock imagery
-scripts/      one-off fixture generator (needs Pillow, not an app dependency)
+  config.py       env-driven settings; single source of truth for provider selection
+  auth.py         bearer-token check
+  db/
+    session.py    async engine (API) + sync engine (Celery worker), URL normalization
+    models.py     Job, BuildingFootprintCache, Feedback
+  schemas/
+    analyze.py    Pydantic models matching the API contract above exactly
+  services/
+    imagery.py    ImageryProvider: mock (real) / google_solar / nearmap (stubs)
+    footprint.py  FootprintProvider: center_crop (real) / osm (real, not live-verified) / sam2 (stub)
+    defects.py    DefectDetector: rule_based (real CV) / yolo (real, needs a model file)
+    scoring.py    deterministic scorer (real) + optional LLM reasoning pass (real, needs a key)
+    temporal.py   year-over-year diff logic (real)
+    storage.py    StorageService: local (real) / s3 (real, not live-verified)
+    webhook.py    signed push to Lovable (real, not live-verified)
+    pipeline.py   orchestrates all of the above -- used by both /analyze and the Celery task
+  workers/
+    celery_app.py Celery instance (Redis broker/backend)
+    tasks.py      the task behind /analyze/async
+  routes/         analyze.py, jobs.py, feedback.py, health.py
+tests/            27 tests, no network calls
+Dockerfile        serves both the API and worker (different start commands)
+railway.json      repo-root Railway config (see /railway.json, not backend/)
+docker-compose.yml  optional local Postgres + Redis
 ```

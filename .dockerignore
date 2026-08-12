@@ -6,7 +6,6 @@
 **/.pytest_cache/
 **/*.egg-info/
 backend/tests/
-backend/scripts/
 backend/README.md
 backend/docker-compose.yml
 .git/

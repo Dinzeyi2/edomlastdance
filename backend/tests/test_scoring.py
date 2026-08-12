@@ -1,27 +1,31 @@
-from app.pipeline.scoring import compute_priority_score, estimate_job_value, normalize_storm_severity
+from app.services.defects import DefectFinding
+from app.services.scoring import compute_score
 
 
-def test_estimate_job_value_uses_material_cost():
-    shingle = estimate_job_value(2000, "asphalt_shingle")
-    metal = estimate_job_value(2000, "metal")
-    assert metal > shingle > 0
+def _finding(type_="staining", severity="minor", confidence=0.6):
+    return DefectFinding(type=type_, severity=severity, bbox=(0.1, 0.1, 0.2, 0.2), tile_index=(0, 0), confidence=confidence)
 
 
-def test_estimate_job_value_falls_back_for_unknown_material():
-    value = estimate_job_value(2000, "solar_tile_exotic")
-    assert value > 0
+def test_no_findings_scores_high_confidence_modest():
+    result = compute_score([])
+    assert result.score >= 90
+    assert result.condition == "good"
+    assert result.confidence < 0.9  # deliberately not overconfident on "nothing found"
 
 
-def test_normalize_storm_severity_hail_vs_wind():
-    assert normalize_storm_severity(2.5, None) == 1.0
-    assert normalize_storm_severity(None, 90) == 1.0
-    assert normalize_storm_severity(None, 40) == 0.0
-    assert 0 < normalize_storm_severity(1.0, None) < 1.0
+def test_more_severe_findings_score_lower():
+    mild = compute_score([_finding(severity="minor")])
+    severe = compute_score([_finding(type_="missing_shingles", severity="severe")])
+    assert severe.score < mild.score
 
 
-def test_compute_priority_score_bounded_and_monotonic():
-    low = compute_priority_score(0.1, max_hail_in=0.5, max_wind_mph=None, estimated_job_value=5000)
-    high = compute_priority_score(0.9, max_hail_in=2.5, max_wind_mph=None, estimated_job_value=25000)
-    assert 0.0 <= low <= 1.0
-    assert 0.0 <= high <= 1.0
-    assert high > low
+def test_score_bounded_0_100():
+    many_severe = [_finding(type_="tarps", severity="severe") for _ in range(50)]
+    result = compute_score(many_severe)
+    assert 0 <= result.score <= 100
+
+
+def test_condition_thresholds():
+    assert compute_score([]).condition == "good"
+    poor = compute_score([_finding(type_="missing_shingles", severity="severe") for _ in range(10)])
+    assert poor.condition == "poor"

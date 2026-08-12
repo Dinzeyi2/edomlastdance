@@ -1,17 +1,23 @@
-# Optional: a real Postgres instance for anyone who wants to run against
-# something closer to production instead of the default SQLite file. Not
-# required to run the app or the test suite -- see README.
+# Optional local infra: real Postgres + Redis, for anyone who wants to run
+# closer to production instead of the zero-config SQLite + eager-Celery
+# defaults (see README "Local development"). Not required to run the app or
+# test suite.
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: roofing
-      POSTGRES_PASSWORD: roofing
-      POSTGRES_DB: roofing
+      POSTGRES_USER: roofai
+      POSTGRES_PASSWORD: roofai
+      POSTGRES_DB: roofai
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
 
 volumes:
   postgres_data:
