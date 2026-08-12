@@ -23,6 +23,7 @@ pillow>=10.4
 numpy>=1.26
 opencv-python-headless>=4.10
 shapely>=2.0
+rasterio>=1.3  # decodes the GeoTIFF the real Google Solar provider fetches
 
 # External calls
 httpx>=0.27

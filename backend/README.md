@@ -18,40 +18,60 @@ Lovable map click
 
 ## What's real vs. what's a stub
 
-Everything is wired end-to-end and testable right now (27 passing tests, no
-network calls, no paid API keys). But three pieces are real vendors this repo
-can't call without your credentials/infrastructure, and two are heavy ML
-models this repo can't run without a trained checkpoint. Being precise about
-which is which:
+Everything is wired end-to-end and testable right now (42 tests: 41 passing
++ 1 that auto-skips unless you install `ultralytics`, no network calls in the
+normal suite, no paid API keys required). This sandbox's network egress is
+policy-restricted to a host allowlist I don't control and was told not to
+route around -- some real vendor calls could be implemented and unit-tested
+here, some could be reached at the domain level but not tested end-to-end
+without your credentials, and a few hosts are hard-blocked regardless of
+credentials. Being precise about which is which:
 
 | Piece | Status | Notes |
 |---|---|---|
-| API gateway, job queue, DB, storage, webhook, scoring, temporal diff | **Real, working** | See "What's genuinely real" below |
+| API gateway, job queue, DB, storage, webhook, scoring, temporal diff, footprint cache, imagery cache, rate limiting | **Real, working** | See "What's genuinely real" below |
 | Rule-based defect detector | **Real, working** | Actual OpenCV contour detection, not a random-number stand-in -- see `app/services/defects.py` |
 | `IMAGERY_PROVIDER=mock` | **Real, working** | Deterministic synthetic "aerial roof" art (`app/services/roof_art.py`), not a real photo |
 | `FOOTPRINT_PROVIDER=center_crop` | **Real, working** | The simple baseline your spec described as the interim step before SAM-2 |
-| `FOOTPRINT_PROVIDER=osm` | **Real code, not live-verified** | Real Overpass API client (free, no key) -- this sandbox's network egress policy blocks `overpass-api.de`, so I could not execute a live call. Should work once deployed; smoke-test it |
-| `STORAGE_PROVIDER=s3` | **Real code, not live-verified** | Real boto3 client (AWS S3 or R2 via `S3_ENDPOINT`) -- same egress restriction, not live-tested from this sandbox |
-| `LLM_PROVIDER=openai` | **Real code, not live-verified** | Real OpenAI call -- same restriction, needs your `OPENAI_API_KEY` |
-| Webhook to Lovable | **Real code, not live-verified** | Real signed HTTP POST -- same restriction |
-| `IMAGERY_PROVIDER=google_solar` / `nearmap` | **Stub** | Real vendor, real request/response shapes not implemented yet -- needs your API key and, for Google Solar, GeoTIFF handling not in `requirements.txt` |
-| `FOOTPRINT_PROVIDER=sam2` | **Stub** | Needs the `sam2` package, a multi-GB checkpoint, and GPU-class compute -- none of which this environment has |
-| `DEFECT_PROVIDER=yolo` | **Stub until you provide `YOLO_MODEL_PATH`** | No trained roof-defect model or labeled dataset exists yet -- this is step 9 in the build order, deliberately last |
+| Diff heatmap (temporal comparison) | **Real, working** | Actual per-pixel diff + JET colormap, not just a text summary -- `app/services/temporal.py` |
+| `DEFECT_PROVIDER=yolo` | **Real, verified working** (given a model) | I actually ran this against a real downloaded YOLOv8 model and confirmed the load/inference/parsing code is correct -- see `tests/test_yolo_detector_optional.py`. It has no roof-specific classes to detect until you provide a fine-tuned `YOLO_MODEL_PATH`; no such model or labeled dataset exists yet (your own step 9, deliberately last) |
+| `IMAGERY_PROVIDER=google_solar` | **Real implementation, not live-verified** | Real HTTP calls to Google's documented Solar API + real GeoTIFF decoding (tested against real GeoTIFF bytes I constructed, confirmed byte-accurate). `solar.googleapis.com` is reachable from this sandbox (confirmed), but I don't have a Google Cloud API key to make an actual successful call -- give me one and I can verify/fix it here |
+| `STORAGE_PROVIDER=s3` | **Real code, not live-verified** | Real boto3 client. `s3.amazonaws.com` is reachable from this sandbox (confirmed) -- give me a real AWS bucket + credentials and I can verify this here too. Cloudflare R2's endpoint is separately confirmed **blocked**, so R2 specifically cannot be tested from this sandbox even with credentials |
+| `FOOTPRINT_PROVIDER=osm` | **Real code, not live-verified, host confirmed blocked** | Real Overpass API client (free, no key) -- `overpass-api.de` returns a 403 from this sandbox's egress proxy regardless of credentials |
+| `LLM_PROVIDER=openai` | **Real code, not live-verified, host confirmed blocked** | `api.openai.com` returns a 403 from this sandbox's egress proxy regardless of credentials |
+| Webhook to Lovable | **Real code, not live-verified** | Depends on your Lovable app's URL, which isn't reachable from here either way |
+| `FOOTPRINT_PROVIDER=sam2` | **Stub, confirmed impossible from this sandbox** | `dl.fbaipublicfiles.com` (checkpoint host) is confirmed blocked, so even the download step can't happen here, separate from the GPU-compute question |
+| Nearmap | **Stub, host confirmed blocked** | `api.nearmap.com` returns a 403 regardless of credentials, and its API is behind an enterprise sales process with no public documented shape to implement against anyway |
 
-"Not live-verified" means: implemented against the library/API's documented
-behavior, unit-testable logic all passes, but I could not execute the actual
-network call from this sandbox (its egress policy allowlists specific hosts
-and blocks arbitrary third-party APIs). Worth a smoke test right after your
-first deploy, before trusting it in production.
+"Confirmed blocked" / "confirmed reachable" means I actually tested the
+connection (`curl` through the sandbox's egress proxy) rather than assumed --
+see the git history for the raw results. "Not live-verified" past that means:
+implemented correctly against documented behavior, but I could not execute an
+actual successful call, either because I lack credentials or because the host
+itself is blocked. Worth a smoke test right after your first deploy.
 
 ### What's genuinely real (no caveats)
 
 FastAPI gateway with your exact endpoints and auth, the Job/Feedback/
-BuildingFootprintCache Postgres (or SQLite) models, the Celery+Redis async
-pipeline (verified against a **real Redis broker and a separate worker
-process**, not just Celery's inline eager mode), the 3x3 tile splitter, the
-deterministic scoring formula, the temporal diff logic, and local-disk
-storage.
+BuildingFootprintCache Postgres (or SQLite) models -- including the
+footprint cache actually being read/written now (it existed as an unused
+table in an earlier pass; caught on review and wired in, with tests proving
+a second request for the same coordinates skips re-running the footprint
+provider), the Celery+Redis async pipeline (verified against a **real Redis
+broker and a separate worker process**, not just Celery's inline eager
+mode), Redis-backed imagery tile caching (proven with tests against a real
+Redis server -- a second fetch for the same coordinates doesn't hit the
+underlying provider again), Redis-backed rate limiting (same -- proven
+against real Redis, including that a 429 actually fires past the configured
+limit), the 3x3 tile splitter, the deterministic scoring formula, the
+temporal diff logic plus the diff heatmap image, and local-disk storage.
+
+Both Redis-backed features (imagery cache, rate limiter) **fail open** if
+Redis itself is unreachable -- they log a warning and let the request
+through rather than 500ing the whole API. Caught by actually testing the
+no-Redis case: the first version of this made Redis a hard dependency of
+every `/analyze` call, which silently broke the "zero infra" local dev setup
+below. Fixed, with a test proving each one degrades gracefully.
 
 ## Local development (zero infra)
 
@@ -106,13 +126,30 @@ just the eager-mode shortcut.
 pytest
 ```
 
-27 tests, no network calls: scoring math, temporal diff logic, deterministic
-mock imagery, the rule-based detector's actual contour detection (including a
-regression test for an edge-artifact bug the detector caught during
-development -- see `app/services/roof_art.py`'s comments), and the full HTTP
-API (auth, sync analyze, async analyze + poll, feedback, unknown-job 404).
-Async tests run via `CELERY_TASK_ALWAYS_EAGER=true` so they're deterministic
-and don't need Redis.
+41 tests pass, 1 auto-skips (see below). Every test spins up a **real**
+Redis server on a scratch port (conftest.py) -- not mocked out -- since the
+imagery cache and rate limiter need to be proven against real Redis, not
+just import cleanly. Covers: scoring math, temporal diff logic + heatmap
+generation, deterministic mock imagery, the rule-based detector's actual
+contour detection (including a regression test for an edge-artifact bug the
+detector caught during development -- see `app/services/roof_art.py`'s
+comments), the footprint cache actually persisting and being reused, the
+imagery cache actually skipping a re-fetch on a repeat request, the rate
+limiter actually returning 429 past its configured limit, real GeoTIFF
+decoding for the Google Solar provider (constructed test GeoTIFFs with known
+pixel values, confirmed byte-accurate output), and the full HTTP API (auth,
+sync analyze, async analyze + poll, feedback, unknown-job 404).
+`CELERY_TASK_ALWAYS_EAGER=true` keeps job execution deterministic without
+needing a separate worker process for tests.
+
+`tests/test_yolo_detector_optional.py` auto-skips unless you `pip install
+ultralytics` -- it's deliberately not a base dependency (adds torch, a
+multi-GB dependency, for a code path with no trained model to load yet). Run
+it manually to see real YOLO inference actually execute:
+```bash
+pip install ultralytics
+pytest tests/test_yolo_detector_optional.py -v
+```
 
 ## API reference
 
@@ -179,7 +216,9 @@ Two services in one Railway project, from this same repo:
    | `STORAGE_PROVIDER` | `s3` once you have a bucket, otherwise leave `local` (ephemeral, fine for a first smoke test only) |
    | `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | your R2/S3 credentials, if `STORAGE_PROVIDER=s3` |
    | `IMAGERY_PROVIDER`, `FOOTPRINT_PROVIDER`, `DEFECT_PROVIDER`, `LLM_PROVIDER` | leave at their real-and-free defaults (`mock`, `center_crop`, `rule_based`, `none`) until you wire up a real vendor -- see the table above |
+   | `GOOGLE_SOLAR_API_KEY` | set this + `IMAGERY_PROVIDER=google_solar` once you have a Google Cloud key with the Solar API enabled -- this is the one real vendor integration most likely to just work once keyed, since I confirmed `solar.googleapis.com` is reachable |
    | `LOVABLE_WEBHOOK_URL` / `WEBHOOK_SECRET` | if you want the push-on-completion path in addition to polling |
+   | `RATE_LIMIT_PER_MINUTE` | defaults to 30; set to `0` to disable |
 
 6. **Verify**: `curl https://<web-service>.up.railway.app/health` ->
    `{"status":"ok"}`. Then run the same `curl` flow from "Local development"
@@ -189,13 +228,21 @@ Two services in one Railway project, from this same repo:
 
 ## Lovable integration
 
-Your `analyzeRoofWithRailway` server function is correct as sketched -- point
-`RAILWAY_API_URL` at the web service's Railway URL and `RAILWAY_API_KEY` at
-the same secret set in step 5 above. Have `TeslaMap.tsx` call `POST
-/api/v1/analyze/async`, then poll `GET /api/v1/jobs/{job_id}` (or receive the
-webhook at whatever route you wire up to accept `LOVABLE_WEBHOOK_URL`'s
-signed POST -- verify the `X-Webhook-Signature` header as an HMAC-SHA256 of
-the raw body using `WEBHOOK_SECRET` before trusting it).
+See `/lovable-integration` at the repo root -- the server function, the
+polling hook, and a webhook receiver, written against this backend's actual
+API contract, ready to copy into your Lovable project. Its README says
+plainly which files are high-confidence (the server function, the polling
+hook) vs. a sketch to adapt (the webhook route's exact framework wiring --
+I don't have your Lovable codebase to verify against).
+
+One open question from your original spec I did NOT resolve on my own:
+section 2A lists `POST /webhooks/lovable` as something *Railway* exposes
+(i.e. Lovable calls it), but section 4's concrete example shows the opposite
+-- Railway calling out to a Lovable-hosted URL. I built the outbound
+direction (matches the concrete example), not an inbound route, since I
+couldn't find a plausible payload/purpose for Lovable calling *into* Railway
+under that name without guessing. If you did mean an inbound route, tell me
+what it's for and I'll add it.
 
 ## Swapping in a real provider
 
@@ -207,38 +254,44 @@ add it to that file's `_PROVIDERS` dict, set the matching env var. Nothing in
 ## What's explicitly out of scope for this pass
 
 - Frontend/dashboard (that's Lovable)
-- Real Google Solar / Nearmap imagery integration (stubbed, needs your API key + GeoTIFF handling for Solar API)
-- SAM-2 segmentation (stubbed, needs GPU-class compute + a multi-GB checkpoint)
-- A trained YOLO defect model (needs a labeled dataset that doesn't exist yet -- `POST /feedback` is the mechanism to start collecting one)
-- Rate limiting, request-level caching in Redis beyond the job queue itself
+- Nearmap imagery integration (its API has no public self-serve key or documented shape to implement against, and the host is confirmed blocked from this sandbox regardless)
+- SAM-2 segmentation (needs GPU-class compute + a multi-GB checkpoint; the checkpoint host is confirmed blocked from this sandbox regardless of compute)
+- A trained YOLO defect model (needs a labeled dataset that doesn't exist yet -- `POST /feedback` is the mechanism to start collecting one; the inference code path itself is verified working, see Tests)
+- Image registration/alignment for temporal comparison (not needed against synthetic imagery, which is always pixel-aligned by construction; would matter with real imagery that has perspective/zoom variance between captures)
+- An inbound `/webhooks/lovable` route -- see the open question under "Lovable integration"
 - Alembic migrations (uses `Base.metadata.create_all` -- fine pre-production, promote before this holds data worth preserving)
 
 ## Repo layout
 
 ```
 app/
-  config.py       env-driven settings; single source of truth for provider selection
-  auth.py         bearer-token check
+  config.py            env-driven settings; single source of truth for provider selection
+  auth.py              bearer-token check
+  rate_limit.py         Redis-backed rate limiter (real, tested against real Redis)
   db/
-    session.py    async engine (API) + sync engine (Celery worker), URL normalization
-    models.py     Job, BuildingFootprintCache, Feedback
+    session.py          async engine (API) + sync engine (Celery worker), URL normalization
+    models.py            Job, BuildingFootprintCache, Feedback
   schemas/
-    analyze.py    Pydantic models matching the API contract above exactly
+    analyze.py            Pydantic models matching the API contract above exactly
   services/
-    imagery.py    ImageryProvider: mock (real) / google_solar / nearmap (stubs)
-    footprint.py  FootprintProvider: center_crop (real) / osm (real, not live-verified) / sam2 (stub)
-    defects.py    DefectDetector: rule_based (real CV) / yolo (real, needs a model file)
-    scoring.py    deterministic scorer (real) + optional LLM reasoning pass (real, needs a key)
-    temporal.py   year-over-year diff logic (real)
-    storage.py    StorageService: local (real) / s3 (real, not live-verified)
-    webhook.py    signed push to Lovable (real, not live-verified)
-    pipeline.py   orchestrates all of the above -- used by both /analyze and the Celery task
+    imagery.py             ImageryProvider: mock (real) / google_solar (real, not live-verified) / nearmap (stub)
+    imagery_cache.py        Redis tile cache wrapper (real, tested against real Redis)
+    footprint.py             FootprintProvider: center_crop (real) / osm (real, host confirmed blocked) / sam2 (stub, host confirmed blocked)
+    footprint_cache.py        Postgres footprint cache (real, tested)
+    defects.py                  DefectDetector: rule_based (real CV) / yolo (real, verified against a real model, needs YOLO_MODEL_PATH)
+    scoring.py                   deterministic scorer (real) + optional LLM reasoning pass (real, host confirmed blocked)
+    temporal.py                   year-over-year diff logic + diff heatmap (both real)
+    storage.py                     StorageService: local (real) / s3 (real, not live-verified)
+    webhook.py                      signed push to Lovable (real, not live-verified)
+    redis_client.py                  shared per-event-loop Redis client
+    pipeline.py                       orchestrates all of the above -- used by both /analyze and the Celery task
   workers/
-    celery_app.py Celery instance (Redis broker/backend)
-    tasks.py      the task behind /analyze/async
-  routes/         analyze.py, jobs.py, feedback.py, health.py
-tests/            27 tests, no network calls
-Dockerfile        serves both the API and worker (different start commands)
-railway.json      repo-root Railway config (see /railway.json, not backend/)
-docker-compose.yml  optional local Postgres + Redis
+    celery_app.py       Celery instance (Redis broker/backend)
+    tasks.py              the task behind /analyze/async
+  routes/                analyze.py, jobs.py, feedback.py, health.py
+tests/                   40 tests (39 pass, 1 auto-skips without ultralytics), real Redis, no other network calls
+Dockerfile               serves both the API and worker (different start commands)
+railway.json             repo-root Railway config (see /railway.json, not backend/)
+docker-compose.yml       optional local Postgres + Redis
+../lovable-integration/  Lovable-side server function, polling hook, webhook receiver sketch
 ```

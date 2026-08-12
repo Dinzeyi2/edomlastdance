@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     lovable_webhook_url: str = ""
     webhook_secret: str = "dev-webhook-secret"
 
+    # --- rate limiting (Redis-backed, applied to /analyze*) ---
+    # 0 disables it. Fixed-window per bearer token -- see app/rate_limit.py.
+    rate_limit_per_minute: int = 30
+
 
 @lru_cache
 def get_settings() -> Settings:

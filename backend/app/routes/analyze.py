@@ -6,11 +6,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_api_key
 from app.db.models import Job, _job_id
 from app.db.session import get_db
+from app.rate_limit import enforce_rate_limit
 from app.schemas.analyze import AnalysisResult, AnalyzeRequest, AsyncAnalyzeResponse
 from app.services.pipeline import run_analysis
 from app.workers.tasks import run_analysis_task
 
-router = APIRouter(prefix="/api/v1", tags=["analyze"], dependencies=[Depends(require_api_key)])
+# Order matters: require_api_key runs first, so an unauthenticated request
+# gets 401 rather than counting against the rate limit.
+router = APIRouter(
+    prefix="/api/v1", tags=["analyze"], dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)]
+)
 
 # Rough estimate surfaced in the async response -- not measured live, just a
 # reasonable expectation to show a caller while it polls.

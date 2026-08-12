@@ -35,6 +35,7 @@ class ImageUrls(BaseModel):
     full: str | None = None
     masked: str | None = None
     tiles: list[str] = []
+    diff_heatmap: str | None = None  # only set when compare_year is requested
 
 
 class AnalysisResult(BaseModel):

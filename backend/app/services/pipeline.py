@@ -13,10 +13,11 @@ from PIL import Image
 from app.schemas.analyze import AnalysisResult, Finding, ImageUrls, TemporalComparison
 from app.services.defects import get_defect_detector
 from app.services.footprint import building_id_for, get_footprint_provider
+from app.services.footprint_cache import get_cached_footprint, save_footprint_cache
 from app.services.imagery import get_imagery_provider
 from app.services.scoring import compute_score, get_reasoning_provider
 from app.services.storage import get_storage_service, new_object_key
-from app.services.temporal import compute_temporal
+from app.services.temporal import compute_diff_heatmap, compute_temporal
 
 GRID_SIZE = 3
 ProgressCallback = Callable[[float, str], Awaitable[None]]
@@ -65,7 +66,10 @@ async def run_analysis(
         previous_img = await imagery.fetch_image(lat, lng, resolution_cm, year=compare_year)
 
     await progress(0.25, "footprint_masking")
-    footprint = await get_footprint_provider().get_footprint(lat, lng)
+    footprint = await get_cached_footprint(lat, lng)
+    if footprint is None:
+        footprint = await get_footprint_provider().get_footprint(lat, lng)
+        await save_footprint_cache(lat, lng, footprint)
     building_id = building_id_for(lat, lng)
     masked_bytes, tiles = _crop_and_grid(current_img.image_bytes, footprint.bbox)
 
@@ -75,6 +79,7 @@ async def run_analysis(
     current_score = compute_score(current_findings)
 
     temporal = None
+    prev_masked_bytes = None
     if previous_img:
         await progress(0.6, "temporal_comparison")
         prev_masked_bytes, _ = _crop_and_grid(previous_img.image_bytes, footprint.bbox)
@@ -97,6 +102,9 @@ async def run_analysis(
             await storage.upload(new_object_key(job_id, f"tile-{i}"), tile_bytes, "image/png")
             for i, tile_bytes in enumerate(tiles)
         ]
+    if prev_masked_bytes is not None:
+        heatmap_bytes = compute_diff_heatmap(masked_bytes, prev_masked_bytes)
+        image_urls.diff_heatmap = await storage.upload(new_object_key(job_id, "diff-heatmap"), heatmap_bytes, "image/png")
 
     await progress(1.0, "finalizing")
 
