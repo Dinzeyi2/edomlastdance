@@ -18,7 +18,7 @@ Lovable map click
 
 ## What's real vs. what's a stub
 
-Everything is wired end-to-end and testable right now (48 tests: 47 passing
+Everything is wired end-to-end and testable right now (46 tests: 45 passing
 + 1 that auto-skips unless you install `ultralytics`, no network calls in the
 normal suite, no paid API keys required). This sandbox's network egress is
 policy-restricted to a host allowlist I don't control and was told not to
@@ -40,7 +40,7 @@ credentials. Being precise about which is which:
 | `FOOTPRINT_PROVIDER=osm` | **Real code, not live-verified, host confirmed blocked** | Real Overpass API client (free, no key) -- `overpass-api.de` returns a 403 from this sandbox's egress proxy regardless of credentials |
 | `LLM_PROVIDER=openai` | **Real code, not live-verified, host confirmed blocked** | `api.openai.com` returns a 403 from this sandbox's egress proxy regardless of credentials |
 | Webhook to Lovable | **Real code, not live-verified** | Depends on your Lovable app's URL, which isn't reachable from here either way |
-| `FOOTPRINT_PROVIDER=sam2` | **Real implementation, model load/inference not verified** | Full SAM-2 inference code + mask-to-bbox conversion (the latter unit-tested for real). Needs a GPU worker -- see `Dockerfile.worker`, `requirements-gpu.txt`, `docs/sam2-railway-setup.md`. **Caught a real supply-chain issue**: `pip install sam2` is NOT Meta's package -- I downloaded and inspected it directly; it's an unrelated third party's PyPI upload. Fixed to install from `github.com/facebookresearch/sam2` instead, and confirmed the config-path convention (`configs/sam2/sam2_hiera_l.yaml`) by reading that package's actual `build_sam.py` source, not guessing. Not verified: actually running it, since the checkpoint host (`dl.fbaipublicfiles.com`) is confirmed blocked from this sandbox and there's no GPU here regardless |
+| `FOOTPRINT_PROVIDER=sam2` | **Real HTTP client here; real model code on Modal, not live-verified** | Railway has no GPU tier (confirmed via Railway's own docs), so SAM-2 runs on Modal instead -- see `/modal-service` at the repo root. This provider is just an HTTP client (tested with a mocked call). **Caught a real supply-chain issue while building the Modal side**: `pip install sam2` is NOT Meta's package -- I downloaded and inspected it directly; it's an unrelated third party's PyPI upload. Fixed to install from `github.com/facebookresearch/sam2` instead, confirmed the config-path convention by reading that package's actual `build_sam.py` source, and verified every Modal SDK call used (`App.cls`, `Image.from_registry`, `Volume.from_name`, etc.) against the real installed `modal` package's signatures. Not verified: `modal deploy` itself and actual inference, since `modal.com` is confirmed blocked from this sandbox and I have no GPU here regardless -- see `/modal-service/README.md` |
 | Nearmap | **Stub, host confirmed blocked** | `api.nearmap.com` returns a 403 regardless of credentials, and its API is behind an enterprise sales process with no public documented shape to implement against anyway |
 
 "Confirmed blocked" / "confirmed reachable" means I actually tested the
@@ -126,7 +126,7 @@ just the eager-mode shortcut.
 pytest
 ```
 
-47 tests pass, 1 auto-skips (see below). Every test spins up a **real**
+45 tests pass, 1 auto-skips (see below). Every test spins up a **real**
 Redis server on a scratch port (conftest.py) -- not mocked out -- since the
 imagery cache and rate limiter need to be proven against real Redis, not
 just import cleanly. Covers: scoring math, temporal diff logic + heatmap
@@ -217,6 +217,7 @@ Two services in one Railway project, from this same repo:
    | `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | your R2/S3 credentials, if `STORAGE_PROVIDER=s3` |
    | `IMAGERY_PROVIDER`, `FOOTPRINT_PROVIDER`, `DEFECT_PROVIDER`, `LLM_PROVIDER` | leave at their real-and-free defaults (`mock`, `center_crop`, `rule_based`, `none`) until you wire up a real vendor -- see the table above |
    | `GOOGLE_SOLAR_API_KEY` | set this + `IMAGERY_PROVIDER=google_solar` once you have a Google Cloud key with the Solar API enabled -- this is the one real vendor integration most likely to just work once keyed, since I confirmed `solar.googleapis.com` is reachable |
+   | `SAM2_MODAL_ENDPOINT_URL` / `SAM2_MODAL_API_KEY` | set these + `FOOTPRINT_PROVIDER=sam2` once you've deployed `/modal-service` (separate deploy, not a Railway service -- see its README) |
    | `LOVABLE_WEBHOOK_URL` / `WEBHOOK_SECRET` | if you want the push-on-completion path in addition to polling |
    | `RATE_LIMIT_PER_MINUTE` | defaults to 30; set to `0` to disable |
 
@@ -255,8 +256,7 @@ add it to that file's `_PROVIDERS` dict, set the matching env var. Nothing in
 
 - Frontend/dashboard (that's Lovable)
 - Nearmap imagery integration (its API has no public self-serve key or documented shape to implement against, and the host is confirmed blocked from this sandbox regardless)
-- Actually running SAM-2 (the code is real and implemented, see `docs/sam2-railway-setup.md` -- but it needs a GPU worker deploy to execute, which this sandbox can't do; not live-verified)
-- Celery queue routing to send jobs specifically to the GPU worker vs. the CPU worker (see `docs/sam2-railway-setup.md` Step 8 -- run one or the other for now, not both simultaneously, until this is added)
+- Actually running SAM-2 (the code is real on both sides -- Railway's HTTP client and the Modal service -- but `modal deploy` and a live inference call need your Modal account, which this sandbox can't reach; see `/modal-service/README.md`)
 - A trained YOLO defect model (needs a labeled dataset that doesn't exist yet -- `POST /feedback` is the mechanism to start collecting one; the inference code path itself is verified working, see Tests)
 - Image registration/alignment for temporal comparison (not needed against synthetic imagery, which is always pixel-aligned by construction; would matter with real imagery that has perspective/zoom variance between captures)
 - An inbound `/webhooks/lovable` route -- see the open question under "Lovable integration"
@@ -277,7 +277,7 @@ app/
   services/
     imagery.py             ImageryProvider: mock (real) / google_solar (real, not live-verified) / nearmap (stub)
     imagery_cache.py        Redis tile cache wrapper (real, tested against real Redis)
-    footprint.py             FootprintProvider: center_crop (real) / osm (real, host confirmed blocked) / sam2 (real code, needs a GPU worker to actually run -- see Dockerfile.worker)
+    footprint.py             FootprintProvider: center_crop (real) / osm (real, host confirmed blocked) / sam2 (real HTTP client -- the model itself runs on Modal, see /modal-service)
     footprint_cache.py        Postgres footprint cache (real, tested)
     defects.py                  DefectDetector: rule_based (real CV) / yolo (real, verified against a real model, needs YOLO_MODEL_PATH)
     scoring.py                   deterministic scorer (real) + optional LLM reasoning pass (real, host confirmed blocked)
@@ -290,12 +290,10 @@ app/
     celery_app.py       Celery instance (Redis broker/backend)
     tasks.py              the task behind /analyze/async
   routes/                analyze.py, jobs.py, feedback.py, health.py
-tests/                   47 tests pass, 1 auto-skips without ultralytics, real Redis, no other network calls
+tests/                   45 tests pass, 1 auto-skips without ultralytics, real Redis, no other network calls
 Dockerfile               serves the API + default CPU worker (different start commands)
-Dockerfile.worker        GPU worker image for FOOTPRINT_PROVIDER=sam2 -- separate on purpose, see docs/sam2-railway-setup.md
-requirements-gpu.txt     extra deps for the GPU worker only (torch/sam2 -- NOT in the base image)
-docs/sam2-railway-setup.md  step-by-step SAM-2 GPU deploy walkthrough
 railway.json             repo-root Railway config (see /railway.json, not backend/)
 docker-compose.yml       optional local Postgres + Redis
 ../lovable-integration/  Lovable-side server function, polling hook, webhook receiver sketch
+../modal-service/        SAM-2 on Modal (the one GPU-dependent piece -- Railway has no GPU tier)
 ```

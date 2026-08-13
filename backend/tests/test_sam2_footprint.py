@@ -1,70 +1,107 @@
-"""Tests the parts of Sam2FootprintProvider that don't need the actual SAM-2
-model: _mask_to_bbox's pure numpy math (real, unit-tested against real mask
-arrays) and the missing-checkpoint error path. The model-loading/inference
-path itself is NOT tested here -- see the module docstring in
-app/services/footprint.py for exactly why (checkpoint host blocked from this
-sandbox). tests/test_yolo_detector_optional.py is the pattern for what a
-"real model, optional test" looks like when the weights ARE reachable;
-apply the same pattern once you can download a SAM-2 checkpoint somewhere
-this can reach.
+"""Tests Sam2FootprintProvider, which is now an HTTP client calling a
+Modal-hosted SAM-2 endpoint (Railway has no GPU tier -- see
+/modal-service). Mocks the HTTP call itself (real network calls to Modal
+aren't reachable from this sandbox anyway -- confirmed, see
+/modal-service/README.md), but tests the real request/response handling
+logic: auth header construction, missing-config error, bbox parsing, and
+the fallback when SAM-2 finds nothing.
 """
-import numpy as np
+import httpx
 import pytest
 
-from app.services.footprint import CENTER_CROP_BBOX, Sam2FootprintProvider, _mask_to_bbox
+from app.services.footprint import CENTER_CROP_BBOX, Sam2FootprintProvider
 
 
-def test_mask_to_bbox_exact_rectangle():
-    mask = np.zeros((100, 200), dtype=bool)
-    mask[10:30, 40:80] = True  # rows 10-29, cols 40-79
+class _FakeResponse:
+    def __init__(self, json_body: dict, status_code: int = 200):
+        self._json_body = json_body
+        self.status_code = status_code
 
-    x0, y0, x1, y1 = _mask_to_bbox(mask)
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=None, response=self)
 
-    assert x0 == pytest.approx(40 / 200)
-    assert x1 == pytest.approx(80 / 200)
-    assert y0 == pytest.approx(10 / 100)
-    assert y1 == pytest.approx(30 / 100)
-
-
-def test_mask_to_bbox_full_image():
-    mask = np.ones((50, 50), dtype=bool)
-    x0, y0, x1, y1 = _mask_to_bbox(mask)
-    assert (x0, y0, x1, y1) == (0.0, 0.0, 1.0, 1.0)
+    def json(self) -> dict:
+        return self._json_body
 
 
-def test_mask_to_bbox_single_pixel():
-    mask = np.zeros((10, 10), dtype=bool)
-    mask[5, 5] = True
-    x0, y0, x1, y1 = _mask_to_bbox(mask)
-    assert x0 == pytest.approx(0.5)
-    assert y0 == pytest.approx(0.5)
-    assert x1 == pytest.approx(0.6)
-    assert y1 == pytest.approx(0.6)
-
-
-def test_mask_to_bbox_empty_mask_falls_back_to_center_crop():
-    mask = np.zeros((50, 50), dtype=bool)
-    assert _mask_to_bbox(mask) == CENTER_CROP_BBOX
-
-
-def test_mask_to_bbox_output_is_always_normalized():
-    rng = np.random.default_rng(42)
-    for _ in range(20):
-        h, w = rng.integers(10, 500), rng.integers(10, 500)
-        mask = rng.random((h, w)) > 0.7
-        x0, y0, x1, y1 = _mask_to_bbox(mask)
-        assert 0 <= x0 <= x1 <= 1
-        assert 0 <= y0 <= y1 <= 1
-
-
-async def test_missing_checkpoint_path_raises_clear_error(monkeypatch):
-    monkeypatch.setenv("SAM2_CHECKPOINT_PATH", "")
+async def test_missing_config_raises_clear_error(monkeypatch):
+    monkeypatch.setenv("SAM2_MODAL_ENDPOINT_URL", "")
+    monkeypatch.setenv("SAM2_MODAL_API_KEY", "")
     from app.config import get_settings
 
     get_settings.cache_clear()
-    Sam2FootprintProvider._model = None
     try:
-        with pytest.raises(RuntimeError, match="SAM2_CHECKPOINT_PATH"):
+        with pytest.raises(RuntimeError, match="SAM2_MODAL_ENDPOINT_URL"):
+            await Sam2FootprintProvider().get_footprint(1.0, 1.0, b"fake-image-bytes")
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_sends_correct_auth_header_and_body(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("SAM2_MODAL_ENDPOINT_URL", "https://example--roofai-sam2.modal.run")
+    monkeypatch.setenv("SAM2_MODAL_API_KEY", "test-modal-key")
+    get_settings.cache_clear()
+
+    captured = {}
+
+    async def fake_post(self, url, content=None, headers=None, **kwargs):
+        captured["url"] = url
+        captured["content"] = content
+        captured["headers"] = headers
+        return _FakeResponse({"bbox": [0.1, 0.2, 0.8, 0.9]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    try:
+        result = await Sam2FootprintProvider().get_footprint(1.0, 1.0, b"fake-image-bytes")
+    finally:
+        get_settings.cache_clear()
+
+    assert captured["url"] == "https://example--roofai-sam2.modal.run"
+    assert captured["content"] == b"fake-image-bytes"
+    assert captured["headers"]["Authorization"] == "Bearer test-modal-key"
+    assert result.bbox == (0.1, 0.2, 0.8, 0.9)
+    assert result.source == "sam2"
+
+
+async def test_null_bbox_falls_back_to_center_crop(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("SAM2_MODAL_ENDPOINT_URL", "https://example--roofai-sam2.modal.run")
+    monkeypatch.setenv("SAM2_MODAL_API_KEY", "test-modal-key")
+    get_settings.cache_clear()
+
+    async def fake_post(self, url, content=None, headers=None, **kwargs):
+        return _FakeResponse({"bbox": None})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    try:
+        result = await Sam2FootprintProvider().get_footprint(1.0, 1.0, b"fake-image-bytes")
+    finally:
+        get_settings.cache_clear()
+
+    assert result.bbox == CENTER_CROP_BBOX
+    assert result.source == "sam2_fallback"
+
+
+async def test_http_error_propagates(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("SAM2_MODAL_ENDPOINT_URL", "https://example--roofai-sam2.modal.run")
+    monkeypatch.setenv("SAM2_MODAL_API_KEY", "wrong-key")
+    get_settings.cache_clear()
+
+    async def fake_post(self, url, content=None, headers=None, **kwargs):
+        return _FakeResponse({}, status_code=401)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
             await Sam2FootprintProvider().get_footprint(1.0, 1.0, b"fake-image-bytes")
     finally:
         get_settings.cache_clear()

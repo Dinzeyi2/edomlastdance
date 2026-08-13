@@ -11,13 +11,12 @@ at trees/street/neighbors. Three tiers, matching the order you laid out:
      egress proxy), so I could not execute a live call to verify it. It
      should work once deployed on Railway (which has normal internet
      egress); worth a smoke test right after deploy.
-  3. sam2: real zero-shot pixel segmentation against Meta's SAM-2 model.
-     Needs a GPU worker (see Dockerfile.worker) -- the checkpoint's host is
-     blocked from the dev/CI sandbox this was built in, so the model-loading
-     and inference path is NOT live-verified from here. The mask-to-bbox
-     math (_mask_to_bbox) IS unit-tested with a real synthetic mask array,
-     independent of the model itself. See docs/sam2-railway-setup.md for
-     the deploy steps.
+  3. sam2: real zero-shot pixel segmentation against Meta's SAM-2 model --
+     but NOT run in this process. Railway has no GPU tier (confirmed via
+     Railway's own docs), so SAM-2 runs on Modal instead (/modal-service at
+     the repo root) and this provider is just an HTTP client that POSTs the
+     image and gets a bbox back. See /modal-service/README.md for the deploy
+     steps and exactly what's verified there vs. not.
 
 Note OSM gives a real polygon in lat/lng, not pixel coordinates in whatever
 image IMAGERY_PROVIDER returned -- projecting a real-world polygon onto an
@@ -32,7 +31,6 @@ SAM-2 fundamentally needs pixels to segment, so this is a required parameter
 even though center_crop/osm ignore it.
 """
 import hashlib
-import io
 import json
 import logging
 import math
@@ -40,7 +38,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import httpx
-import numpy as np
 from shapely.geometry import Point, shape
 
 from app.config import get_settings
@@ -137,105 +134,48 @@ class OsmFootprintProvider(FootprintProvider):
         return FootprintResult(bbox=CENTER_CROP_BBOX, polygon_geojson=None, area_sqm=None, source="osm_fallback")
 
 
-def _mask_to_bbox(mask: np.ndarray) -> tuple[float, float, float, float]:
-    """Convert a boolean segmentation mask to a normalized (x0, y0, x1, y1)
-    bbox -- the existing crop/tile pipeline (app/services/pipeline.py) works
-    in bbox terms, not arbitrary polygons, so this is the bridge between a
-    real per-pixel mask and that pipeline. Pure numpy, no SAM-2 dependency --
-    fully unit-testable without the model itself, see tests/test_sam2_footprint.py.
-    Falls back to the center-crop bbox if the mask is empty (SAM-2 found
-    nothing at the prompt point).
-    """
-    h, w = mask.shape
-    ys, xs = np.where(mask)
-    if len(xs) == 0 or len(ys) == 0:
-        return CENTER_CROP_BBOX
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    return (round(x0 / w, 4), round(y0 / h, 4), round((x1 + 1) / w, 4), round((y1 + 1) / h, 4))
-
-
 class Sam2FootprintProvider(FootprintProvider):
-    """Real zero-shot segmentation against Meta's SAM-2. Loads the model once
-    per worker process (class-level cache, same pattern as
-    app/services/defects.py's YoloDefectDetector), prompts it with the image
-    center point (the imagery provider is expected to center the frame on
-    the requested lat/lng, so the building of interest should be roughly
-    centered), takes the highest-scoring of SAM-2's returned masks, and
-    converts it to a bbox via _mask_to_bbox.
+    """SAM-2 segmentation, run on Modal, not in this process -- Railway has
+    no GPU tier (confirmed via Railway's own docs), so this is an HTTP
+    client that POSTs the image to a Modal-hosted SAM-2 endpoint and gets a
+    bbox back. See /modal-service (repo root) for the actual model code and
+    deploy steps, and /modal-service/README.md for exactly what's verified
+    there vs. not.
 
-    Needs SAM2_CHECKPOINT_PATH (a downloaded .pt file, e.g.
-    sam2_hiera_large.pt) and the real `sam2` + `torch` packages -- deliberately
-    NOT in the base requirements.txt (multi-GB, GPU-oriented), see
-    requirements-gpu.txt and Dockerfile.worker. IMPORTANT: `pip install sam2`
-    installs an unrelated third party's PyPI upload, not Meta's package --
-    confirmed by downloading and inspecting it (see requirements-gpu.txt).
-    Install from Meta's actual repo instead.
-
-    build_sam2()'s config_file argument (SAM2_CONFIG_NAME) is confirmed
-    correct by reading the real build_sam.py source directly (its
-    HF_MODEL_ID_TO_FILENAMES table) -- default is
-    "configs/sam2/sam2_hiera_l.yaml", matching the sam2_hiera_large.pt
-    checkpoint. NOT live-verified: model loading and inference themselves,
-    since this was written in a sandbox whose network egress blocks the
-    checkpoint's host (dl.fbaipublicfiles.com), so no checkpoint could be
-    downloaded to actually run this here. The non-model-dependent part
-    (_mask_to_bbox) is unit-tested for real.
+    Needs SAM2_MODAL_ENDPOINT_URL and SAM2_MODAL_API_KEY (the latter must
+    match the SAM2_API_KEY set in the Modal secret, see
+    /modal-service/README.md Step 3).
     """
 
-    _model = None  # class-level: loaded once per worker process, not per-request
-
-    def _load_predictor(self):
-        if Sam2FootprintProvider._model is not None:
-            return Sam2FootprintProvider._model
-
-        settings = get_settings()
-        if not settings.sam2_checkpoint_path:
-            raise RuntimeError(
-                "FOOTPRINT_PROVIDER=sam2 requires SAM2_CHECKPOINT_PATH to point at a "
-                "downloaded SAM-2 checkpoint (e.g. sam2_hiera_large.pt). "
-                "Set FOOTPRINT_PROVIDER=center_crop or =osm for now."
-            )
-        try:
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-        except ImportError as exc:
-            raise RuntimeError(
-                "FOOTPRINT_PROVIDER=sam2 requires the `sam2` package plus torch "
-                "(pip install -r requirements-gpu.txt) -- not installed by default, "
-                "see Dockerfile.worker."
-            ) from exc
-
-        sam2_model = build_sam2(settings.sam2_config_name, settings.sam2_checkpoint_path, device=settings.sam2_device)
-        Sam2FootprintProvider._model = SAM2ImagePredictor(sam2_model)
-        return Sam2FootprintProvider._model
+    REQUEST_TIMEOUT_S = 60.0  # generous -- covers a cold GPU container start
 
     async def get_footprint(self, lat: float, lng: float, image_bytes: bytes) -> FootprintResult:
-        import asyncio
+        settings = get_settings()
+        if not settings.sam2_modal_endpoint_url or not settings.sam2_modal_api_key:
+            raise RuntimeError(
+                "FOOTPRINT_PROVIDER=sam2 requires SAM2_MODAL_ENDPOINT_URL and "
+                "SAM2_MODAL_API_KEY (see /modal-service/README.md). "
+                "Set FOOTPRINT_PROVIDER=center_crop or =osm for now."
+            )
 
-        predictor = self._load_predictor()
-        # torch inference is sync/blocking -- run off the event loop so it
-        # doesn't stall other requests/tasks in the same process.
-        return await asyncio.to_thread(self._segment, predictor, image_bytes)
+        async with httpx.AsyncClient(timeout=self.REQUEST_TIMEOUT_S) as client:
+            resp = await client.post(
+                settings.sam2_modal_endpoint_url,
+                content=image_bytes,
+                headers={
+                    "Authorization": f"Bearer {settings.sam2_modal_api_key}",
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+            resp.raise_for_status()
+            payload = resp.json()
 
-    @staticmethod
-    def _segment(predictor, image_bytes: bytes) -> FootprintResult:
-        from PIL import Image
+        bbox = payload.get("bbox")
+        if bbox is None:
+            logger.warning("SAM-2 found nothing at the prompt point, falling back to center_crop")
+            return FootprintResult(bbox=CENTER_CROP_BBOX, polygon_geojson=None, area_sqm=None, source="sam2_fallback")
 
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
-        h, w = arr.shape[:2]
-
-        predictor.set_image(arr)
-        center_point = np.array([[w // 2, h // 2]])
-        center_label = np.array([1])  # 1 = foreground prompt
-
-        masks, scores, _ = predictor.predict(
-            point_coords=center_point, point_labels=center_label, multimask_output=True
-        )
-        best_mask = masks[int(np.argmax(scores))].astype(bool)
-
-        return FootprintResult(bbox=_mask_to_bbox(best_mask), polygon_geojson=None, area_sqm=None, source="sam2")
+        return FootprintResult(bbox=tuple(bbox), polygon_geojson=None, area_sqm=None, source="sam2")
 
 
 _PROVIDERS = {

@@ -1,0 +1,5 @@
+# For running `modal deploy` / `modal secret create` locally. The actual
+# GPU-side dependencies (torch, sam2, pillow, numpy, fastapi) are declared
+# inside sam2_service.py's modal.Image definition and installed by Modal
+# inside the remote container -- they do NOT need to be installed here.
+modal>=1.5
