@@ -55,10 +55,17 @@ checkpoint_volume = modal.Volume.from_name("sam2-checkpoints", create_if_missing
 CHECKPOINT_DIR = "/checkpoints"
 CHECKPOINT_PATH = f"{CHECKPOINT_DIR}/sam2_hiera_large.pt"
 
-# Confirmed by reading Meta's actual build_sam.py source directly (its
-# HF_MODEL_ID_TO_FILENAMES table maps facebook/sam2-hiera-large to this
-# exact path) -- not a guess. Matches sam2_hiera_large.pt.
-CONFIG_NAME = "configs/sam2/sam2_hiera_l.yaml"
+# Real bug caught from an actual `modal deploy` + live checkpoint download:
+# "Unexpected key(s) in state_dict: no_obj_embed_spatial,
+# obj_ptr_tpos_proj.weight, obj_ptr_tpos_proj.bias" -- those keys only exist
+# in SAM 2.1's architecture, not 2.0's. Meta's README lists the 2.1
+# checkpoint first/as the recommended one, so that's what got downloaded --
+# but this config path was still pointing at the 2.0 config
+# (configs/sam2/sam2_hiera_l.yaml), which doesn't have those layers at all.
+# Fixed to the matching 2.1 config. If you deliberately want the 2.0
+# checkpoint instead, use configs/sam2/sam2_hiera_l.yaml + a 2.0 checkpoint
+# URL together -- the config and checkpoint version must always match.
+CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # Create with: modal secret create roofai-sam2-secrets SAM2_API_KEY=<random value> SAM2_CHECKPOINT_URL=<url from facebookresearch/sam2's README>
 # SAM2_API_KEY must match SAM2_MODAL_API_KEY on the Railway side (app/config.py).

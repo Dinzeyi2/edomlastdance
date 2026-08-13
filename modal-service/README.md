@@ -27,10 +27,20 @@ modal setup   # opens a browser to link your existing Modal account
 
 ## Step 2: Get the real SAM-2 checkpoint URL
 
-Same requirement as before: go to
-**https://github.com/facebookresearch/sam2**, find "Model Checkpoints", copy
-the download URL for `sam2_hiera_large.pt`. I could not fetch this myself —
-`dl.fbaipublicfiles.com` is confirmed blocked from this sandbox.
+Go to **https://github.com/facebookresearch/sam2**, find "Model
+Checkpoints", copy the download URL for the **large** checkpoint.
+
+**Important, caught from an actual failed deploy**: Meta ships two model
+generations, SAM 2.0 and SAM 2.1, with different checkpoint files
+(`sam2_hiera_large.pt` vs `sam2.1_hiera_large.pt`) that are NOT
+interchangeable with each other's config. `sam2_service.py`'s `CONFIG_NAME`
+is set to the **2.1** config (`configs/sam2.1/sam2.1_hiera_l.yaml`) since
+that's the version Meta's README lists first/recommends now. Make sure the
+checkpoint URL you copy is the **2.1** one -- if you deliberately want the
+older 2.0 checkpoint instead, you must also change `CONFIG_NAME` in
+`sam2_service.py` to `configs/sam2/sam2_hiera_l.yaml` to match, or you'll
+hit `RuntimeError: Error(s) in loading state_dict for SAM2Base: Unexpected
+key(s)...` — exactly the error this note exists because of.
 
 ## Step 3: Create the Modal secret
 
@@ -92,15 +102,18 @@ and Modal's dashboard logs (`modal app logs roofai-sam2`) for the request.
 
 ## If it fails, most likely first
 
-1. **Checkpoint download fails inside the container** — `SAM2_CHECKPOINT_URL`
+1. **Checkpoint/config version mismatch** — this actually happened on the
+   first real deploy: `RuntimeError: Error(s) in loading state_dict for
+   SAM2Base: Unexpected key(s)...`. Means the checkpoint you downloaded
+   (2.0 vs 2.1) doesn't match `CONFIG_NAME` in `sam2_service.py`. See Step 2.
+2. **Checkpoint download fails inside the container** — `SAM2_CHECKPOINT_URL`
    wrong, expired, or requires auth Modal's container doesn't have. Check
    `modal app logs roofai-sam2` for the `urllib.request.urlretrieve` error.
-2. **Cold start timeout** — first request after a scale-to-zero has to
+3. **Cold start timeout** — first request after a scale-to-zero has to
    download/load a multi-GB model; if it's slower than the 120s function
    timeout in `sam2_service.py`, raise `timeout=` there and redeploy.
-3. **Config path mismatch** — only relevant if you change `CONFIG_NAME` in
-   `sam2_service.py` to a different model size than `sam2_hiera_large.pt`;
-   the default is confirmed correct for the large model (verified against
-   the real `build_sam.py` source, not guessed).
 
-None of these three are things I can pre-verify from this sandbox.
+If a container keeps failing repeatedly right after deploy (Modal's
+dashboard shows "crash-looping" on the Containers tab), that's this list,
+not a networking/curl issue on your end -- check `modal app logs
+<app-name>` for the real Python traceback before doing anything else.
