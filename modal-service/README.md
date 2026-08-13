@@ -102,6 +102,28 @@ Then trigger a real analysis from Railway (`POST /api/v1/analyze/async`
 with `FOOTPRINT_PROVIDER=sam2` set) and check both Railway's worker logs
 and Modal's dashboard logs (`modal app logs roofai-sam2`) for the request.
 
+## Latency: cold starts vs. warm calls
+
+A warm container answers in ~1-2s (real measurement: a live request took
+1.60s execution). A **cold** container -- one spun up because nothing hit
+this endpoint recently -- takes ~15s, since it has to boot, load the model
+onto a fresh GPU, etc.
+
+`sam2_service.py` sets `min_containers=1`, which keeps one GPU container
+running at all times so cold starts basically never happen once deployed.
+This costs you continuous T4 GPU time even at zero traffic -- that's the
+trade-off. If you'd rather not pay for an always-on GPU and can tolerate
+occasional slow first-requests, remove `min_containers=1` and rely on
+`scaledown_window=300` alone (keeps a container warm for 5 min after the
+last request, then scales to zero).
+
+For many concurrent users: raise `min_containers` further (e.g. `2` or
+`3`) so more than one request can be served by a warm container at once
+instead of queueing behind a single GPU, and check Modal's
+[autoscaling docs](https://modal.com/docs/guide/scale) for
+`buffer_containers` if you want Modal to proactively scale up ahead of a
+burst rather than reactively.
+
 ## If it fails, most likely first
 
 1. **Checkpoint/config version mismatch** — this actually happened on the

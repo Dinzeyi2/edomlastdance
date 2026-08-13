@@ -83,6 +83,12 @@ secrets = modal.Secret.from_name("roofai-sam2-secrets")
     secrets=[secrets],
     scaledown_window=300,  # keep a warm container for 5 min after the last request
     timeout=120,
+    # Keeps 1 GPU container running at all times instead of scaling to zero
+    # between requests -- eliminates the ~15s cold start (model load onto a
+    # fresh GPU) on every request after an idle period, at the cost of
+    # paying for 1 T4 continuously. Raise this if concurrent request volume
+    # grows past what 1 container can handle serially.
+    min_containers=1,
 )
 class Sam2Service:
     @modal.enter()
