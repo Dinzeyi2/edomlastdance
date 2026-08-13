@@ -1,5 +1,14 @@
 # For running `modal deploy` / `modal secret create` locally. The actual
-# GPU-side dependencies (torch, sam2, pillow, numpy, fastapi) are declared
-# inside sam2_service.py's modal.Image definition and installed by Modal
-# inside the remote container -- they do NOT need to be installed here.
+# GPU-side dependencies (torch, sam2, pillow, numpy) are declared inside
+# sam2_service.py's modal.Image definition and installed by Modal inside the
+# remote container -- they do NOT need to be installed here.
+#
+# fastapi IS needed here too, even though it's also installed in the remote
+# image separately: `modal deploy` imports sam2_service.py locally first (to
+# build the app graph before shipping it), and that file does
+# `from fastapi import Request` at module scope so the `segment` endpoint
+# can be typed to receive the raw request instead of FastAPI trying to
+# validate it as a body/query field (see sam2_service.py's comment on that
+# import for the real 422 bug this fixed).
 modal>=1.5
+fastapi>=0.110

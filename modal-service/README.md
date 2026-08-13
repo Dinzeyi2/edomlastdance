@@ -21,7 +21,9 @@ Modal account makes possible and this sandbox can't.
 ## Step 1: Install the CLI and authenticate
 
 ```bash
-pip install modal
+pip install -r requirements.txt   # modal + fastapi (fastapi is needed locally
+                                   # too -- `modal deploy` imports sam2_service.py
+                                   # on your machine before shipping it)
 modal setup   # opens a browser to link your existing Modal account
 ```
 
@@ -117,3 +119,20 @@ If a container keeps failing repeatedly right after deploy (Modal's
 dashboard shows "crash-looping" on the Containers tab), that's this list,
 not a networking/curl issue on your end -- check `modal app logs
 <app-name>` for the real Python traceback before doing anything else.
+
+4. **Every call returns `422 Unprocessable Entity`, even correct ones** --
+   this actually happened after fixing the checkpoint/config issue above:
+   containers came up fine (no more crash-looping), but every request --
+   including ones with a correct body and a correct `Authorization` header
+   -- came back 422. Root cause: `segment(self, request)`'s `request`
+   parameter had no type annotation, so FastAPI (which Modal uses
+   internally to build the endpoint) couldn't tell it was meant to receive
+   the raw request object, and instead treated it as a required *query
+   string* parameter -- which no client was ever sending, hence "field
+   required" on every call. Fixed by annotating it as `fastapi.Request`
+   (`from fastapi import Request` at the top of `sam2_service.py`, then
+   `async def segment(self, request: Request):`). If you're editing this
+   file yourself and add more endpoint parameters, the same rule applies to
+   those too -- FastAPI infers each parameter's source (path/query/body)
+   from its type annotation, so an unannotated one won't behave the way
+   you expect.

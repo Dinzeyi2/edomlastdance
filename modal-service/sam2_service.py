@@ -27,6 +27,7 @@ from Meta's real repo below instead.
 import os
 
 import modal
+from fastapi import Request
 
 app = modal.App("roofai-sam2")
 
@@ -130,11 +131,22 @@ class Sam2Service:
         return {"bbox": mask_to_bbox(best_mask)}
 
     @modal.fastapi_endpoint(method="POST")
-    async def segment(self, request):
+    async def segment(self, request: Request):
         """POST the raw image bytes as the request body, with
         `Authorization: Bearer <SAM2_API_KEY>`. Returns
         {"bbox": [x0, y0, x1, y1]} normalized 0-1, or {"bbox": null} if
         SAM-2 found nothing at the prompt point.
+
+        Real bug caught from an actual deploy: this parameter was
+        previously unannotated (`async def segment(self, request):`).
+        FastAPI can't tell an unannotated parameter is meant to be the raw
+        Request object, so it treated `request` as a required *query*
+        string parameter instead -- every single call (including ones with
+        a correct body and auth header) came back `422 Unprocessable
+        Entity: field required` because no `?request=...` query string was
+        ever sent. Annotating it as `fastapi.Request` tells FastAPI to
+        inject the actual request object instead of trying to validate it
+        as input.
         """
         from fastapi import HTTPException
 
