@@ -36,6 +36,10 @@ app = modal.App("roofai-sam2")
 # exist via Docker Hub's registry API.
 sam2_image = (
     modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime", add_python="3.11")
+    # `pip install git+https://...` needs the `git` binary to clone the repo
+    # -- the base image's build container doesn't have it. Caught by an
+    # actual `modal deploy` run: "ERROR: Cannot find command 'git'".
+    .apt_install("git")
     .pip_install(
         "git+https://github.com/facebookresearch/sam2.git",  # NOT `pip install sam2` -- see module docstring
         "pillow",
