@@ -13,7 +13,7 @@ def test_building_id_is_deterministic_and_rounds_coordinates():
 
 
 def test_center_crop_bbox_is_inset_and_normalized():
-    result = asyncio.run(CenterCropProvider().get_footprint(0.0, 0.0))
+    result = asyncio.run(CenterCropProvider().get_footprint(0.0, 0.0, b""))
     x0, y0, x1, y1 = result.bbox
     assert 0 < x0 < x1 < 1
     assert 0 < y0 < y1 < 1

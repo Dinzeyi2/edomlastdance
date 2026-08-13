@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_reasoning_model: str = "gpt-4o-mini"
     yolo_model_path: str = ""
+    sam2_checkpoint_path: str = ""  # e.g. /models/sam2_hiera_large.pt -- see Dockerfile.worker
+    # Confirmed by reading the actual build_sam.py source (its
+    # HF_MODEL_ID_TO_FILENAMES table): the large model's config is at this
+    # path *inside the installed package*, not a bare filename -- a
+    # top-level "sam2_hiera_l.yaml" (no configs/ prefix) also exists in the
+    # package but is the legacy/unused location. Matches
+    # sam2_hiera_large.pt, the checkpoint your spec named.
+    sam2_config_name: str = "configs/sam2/sam2_hiera_l.yaml"
+    sam2_device: str = "cuda"  # "cuda" on a GPU worker, "cpu" otherwise (much slower)
 
     # --- storage ---
     s3_endpoint: str = ""  # e.g. https://<accountid>.r2.cloudflarestorage.com for R2; blank = AWS S3

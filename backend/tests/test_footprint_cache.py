@@ -14,7 +14,7 @@ async def test_cache_miss_then_hit():
     lat, lng = 40.7128, -74.0060
     assert await get_cached_footprint(lat, lng) is None
 
-    result = await CenterCropProvider().get_footprint(lat, lng)
+    result = await CenterCropProvider().get_footprint(lat, lng, b"")
     await save_footprint_cache(lat, lng, result)
 
     cached = await get_cached_footprint(lat, lng)
@@ -25,7 +25,7 @@ async def test_cache_miss_then_hit():
 
 async def test_cache_row_actually_persisted_in_db():
     lat, lng = 51.5074, -0.1278
-    result = await CenterCropProvider().get_footprint(lat, lng)
+    result = await CenterCropProvider().get_footprint(lat, lng, b"")
     await save_footprint_cache(lat, lng, result)
 
     async with AsyncSessionLocal() as db:
@@ -38,9 +38,9 @@ async def test_pipeline_uses_cache_on_second_call(monkeypatch):
     real_provider = get_footprint_provider()
 
     class _CountingWrapper:
-        async def get_footprint(self, lat, lng):
+        async def get_footprint(self, lat, lng, image_bytes):
             calls["count"] += 1
-            return await real_provider.get_footprint(lat, lng)
+            return await real_provider.get_footprint(lat, lng, image_bytes)
 
     monkeypatch.setattr("app.services.pipeline.get_footprint_provider", lambda: _CountingWrapper())
 

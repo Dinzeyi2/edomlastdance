@@ -68,7 +68,7 @@ async def run_analysis(
     await progress(0.25, "footprint_masking")
     footprint = await get_cached_footprint(lat, lng)
     if footprint is None:
-        footprint = await get_footprint_provider().get_footprint(lat, lng)
+        footprint = await get_footprint_provider().get_footprint(lat, lng, current_img.image_bytes)
         await save_footprint_cache(lat, lng, footprint)
     building_id = building_id_for(lat, lng)
     masked_bytes, tiles = _crop_and_grid(current_img.image_bytes, footprint.bbox)
