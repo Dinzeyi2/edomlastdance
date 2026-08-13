@@ -5,11 +5,30 @@ and the factories should read os.environ directly.
 """
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @model_validator(mode="after")
+    def _strip_whitespace_from_string_fields(self) -> "Settings":
+        """Real bug this fixed: a Railway env var value with a stray
+        leading/trailing space or newline (easy to introduce via
+        copy/paste -- e.g. copying a key out of a chat message that had a
+        trailing newline) looks identical in Railway's dashboard but fails
+        an exact/constant-time comparison in app/auth.py's
+        `hmac.compare_digest(token, expected)`. Stripping every string
+        field here means a whitespace-mangled secret in Railway's UI can't
+        silently break auth or any other exact-match comparison.
+        """
+        for name, value in self.__dict__.items():
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped != value:
+                    object.__setattr__(self, name, stripped)
+        return self
 
     # --- auth (Lovable -> Railway) ---
     railway_api_key: str = "dev-local-key"
